@@ -875,6 +875,76 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Image upload for ref=${ref}, coordinate=${coordinate} — use drag & drop or file input.` }] };
   },
 
+  // Upload any local file to a file input using CDP Page.setInterceptFileChooserDialog
+  // This bypasses Chrome's user activation requirement for native file picker dialogs.
+  // filePath: absolute path on local disk (e.g. "C:/Users/Nodnarb/Desktop/video.mp4")
+  // selector: CSS selector to find the file input (default: 'input[type="file"]')
+  // inputIndex: which matching input to use (default: 0)
+  async upload_local_file(args) {
+    const { tabId, filePath, selector = 'input[type="file"]', inputIndex = 0 } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!filePath) return { content: [{ type: "text", text: "filePath is required" }] };
+
+    await ensureAttached(tabId);
+
+    // Enable Page domain for file chooser interception
+    const state = attachedTabs.get(tabId);
+    if (!state.enabledDomains.has("Page")) {
+      await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
+      state.enabledDomains.add("Page");
+    }
+
+    // Set up the intercept BEFORE triggering the click
+    await chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: true });
+
+    // Wait for the fileChooserOpened event, then inject the file
+    const uploadPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        chrome.debugger.onEvent.removeListener(handler);
+        reject(new Error("Timed out waiting for fileChooserOpened event (10s)"));
+      }, 10000);
+
+      function handler(source, method, params) {
+        if (source.tabId !== tabId || method !== "Page.fileChooserOpened") return;
+        chrome.debugger.onEvent.removeListener(handler);
+        clearTimeout(timeout);
+
+        // params.backendNodeId is the "blessed" handle that Chrome allows setFileInputFiles on
+        chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
+          backendNodeId: params.backendNodeId,
+          files: [filePath],
+        }).then(() => {
+          chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
+          resolve(`File injected: ${filePath}`);
+        }).catch(err => {
+          chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
+          reject(err);
+        });
+      }
+
+      chrome.debugger.onEvent.addListener(handler);
+    });
+
+    // Trigger the file input click — this fires fileChooserOpened instead of OS dialog
+    await cdp(tabId, "Runtime.evaluate", {
+      expression: `(() => {
+        const inputs = document.querySelectorAll(${JSON.stringify(selector)});
+        const inp = inputs[${inputIndex}];
+        if (!inp) return 'input_not_found';
+        inp.click();
+        return 'clicked';
+      })()`,
+      returnByValue: true,
+    });
+
+    try {
+      const result = await uploadPromise;
+      return { content: [{ type: "text", text: result }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `upload_local_file failed: ${err.message}` }] };
+    }
+  },
+
   async gif_creator(args) {
     return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
   },
