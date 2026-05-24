@@ -438,7 +438,19 @@ async function callTool(toolName, args) {
   }
 }
 
-// --- MCP Server with all 18 tools ---
+// --- MCP Server with 13 consolidated tools ---
+// NOTE: Intentionally kept at 13 tools (down from 19) to stay under Claude Code's tool-search
+// deferral threshold. When Claude Code has too many tools, it activates "Tool Search" mode,
+// which generates `tool_reference` content blocks. These blocks are rejected with a 400 error
+// by proxies, AWS Bedrock, Vertex AI, and older model versions. Keeping tool count low
+// prevents this. (Fixes Issue #10: API Error "Unexpected content chunk type tool_reference")
+//
+// Consolidations made (19 → 13):
+//   tabs_context_mcp + tabs_create_mcp   → tabs_mcp (action: "context"|"create")
+//   read_console_messages + read_network_requests → read_debug (type: "console"|"network")
+//   shortcuts_list + shortcuts_execute   → shortcuts (action: "list"|"execute")
+//   upload_image + upload_local_file     → upload (type: "image"|"file")
+//   get_page_text + resize_window        → merged into read_page (format="text", width+height)
 
 const server = new McpServer({
   name: "open-claude-in-chrome",
@@ -467,44 +479,48 @@ const server = new McpServer({
     });
   };
 }
-// 1. tabs_context_mcp
+
+// 1. tabs_mcp — consolidated tabs_context_mcp + tabs_create_mcp
 server.tool(
-  "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
-  { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
-  async (args) => callTool("tabs_context_mcp", args)
+  "tabs_mcp",
+  'Manage MCP tab group. CRITICAL: Call with action="context" at least once before using other browser tools to get valid tab IDs. Each new conversation should create its own tab with action="create" rather than reusing existing tabs.',
+  {
+    action: z.enum(["context", "create"]).describe(
+      'Action to perform: "context" — get the current MCP tab group info and all tab IDs (use createIfEmpty to auto-create if none exists); "create" — create a new empty tab in the MCP tab group.'
+    ),
+    createIfEmpty: z.boolean().optional().describe(
+      'For action="context" only: if no MCP tab group exists, create a new window with a tab group. Has no effect if a group already exists.'
+    ),
+  },
+  async (args) => {
+    if (args.action === "create") return callTool("tabs_create_mcp", args);
+    // action === "context"
+    return callTool("tabs_context_mcp", args);
+  }
 );
 
-// 2. tabs_create_mcp
-server.tool(
-  "tabs_create_mcp",
-  "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
-  {},
-  async (args) => callTool("tabs_create_mcp", args)
-);
-
-// 3. navigate
+// 2. navigate
 server.tool(
   "navigate",
-  'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+  'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_mcp first to get available tabs.',
   {
     url: z.string().describe('The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.'),
-    tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("navigate", args)
 );
 
-// 4. computer
+// 3. computer
 server.tool(
   "computer",
-  "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
+  "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
   {
     action: z.enum([
       "left_click", "right_click", "double_click", "triple_click",
       "type", "screenshot", "wait", "scroll", "key",
       "left_click_drag", "zoom", "scroll_to", "hover"
     ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
-    tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
     coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
     duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
     modifiers: z.string().optional().describe('Modifier keys for click actions. Supports: "ctrl", "shift", "alt", "cmd" (or "meta"), "win" (or "windows"). Can be combined with "+" (e.g., "ctrl+shift", "cmd+alt"). Optional.'),
@@ -519,40 +535,30 @@ server.tool(
   async (args) => callTool("computer", args)
 );
 
-// 5. find
+// 4. find
 server.tool(
   "find",
-  'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+  'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_mcp first to get available tabs.',
   {
     query: z.string().describe('Natural language description of what to find (e.g., "search bar", "add to cart button", "product title containing organic")'),
-    tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("find", args)
 );
 
-// 6. form_input
+// 5. form_input
 server.tool(
   "form_input",
-  "Set values in form elements using element reference ID from the read_page tool. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Set values in form elements using element reference ID from the read_page tool. If you don't have a valid tab ID, use tabs_mcp first to get available tabs.",
   {
     ref: z.string().describe('Element reference ID from the read_page tool (e.g., "ref_1", "ref_2")'),
     value: z.union([z.string(), z.boolean(), z.number()]).describe("The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number"),
-    tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to set form value in. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("form_input", args)
 );
 
-// 7. get_page_text
-server.tool(
-  "get_page_text",
-  "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("get_page_text", args)
-);
-
-// 8. gif_creator
+// 7. gif_creator
 server.tool(
   "gif_creator",
   "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF.",
@@ -573,94 +579,128 @@ server.tool(
   async (args) => callTool("gif_creator", args)
 );
 
-// 9. javascript_tool
+// 8. javascript_tool
 server.tool(
   "javascript_tool",
-  "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_mcp first to get available tabs.",
   {
     action: z.literal("javascript_exec").describe("Must be set to 'javascript_exec'"),
     text: z.string().describe("The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables."),
-    tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("javascript_tool", args)
 );
 
-// 10. read_console_messages
+// 9. read_debug — consolidated read_console_messages + read_network_requests
 server.tool(
-  "read_console_messages",
-  "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
+  "read_debug",
+  'Read browser debug information from a tab: console messages (console.log/error/warn) or network requests (XHR, Fetch, etc.). If you don\'t have a valid tab ID, use tabs_mcp first to get available tabs.',
   {
-    tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    pattern: z.string().optional().describe("Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages."),
-    limit: z.number().optional().describe("Maximum number of messages to return. Defaults to 100. Increase only if you need more results."),
-    onlyErrors: z.boolean().optional().describe("If true, only return error and exception messages. Default is false (return all message types)."),
-    clear: z.boolean().optional().describe("If true, clear the console messages after reading to avoid duplicates on subsequent calls. Default is false."),
+    type: z.enum(["console", "network"]).describe(
+      '"console" — read browser console messages (console.log, errors, warnings). "network" — read HTTP network requests made by the page (XHR, Fetch, documents, images, etc.).'
+    ),
+    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
+    // Console-specific
+    pattern: z.string().optional().describe('For type="console": Regex pattern to filter console messages (e.g., "error|warning"). Always provide a pattern to avoid too many irrelevant messages.'),
+    onlyErrors: z.boolean().optional().describe('For type="console": If true, only return error and exception messages.'),
+    // Network-specific
+    urlPattern: z.string().optional().describe('For type="network": URL substring filter. Only requests whose URL contains this string will be returned (e.g., "/api/" or "example.com").'),
+    // Shared
+    limit: z.number().optional().describe("Maximum number of entries to return. Defaults to 100."),
+    clear: z.boolean().optional().describe("If true, clear the entries after reading to avoid duplicates on subsequent calls. Default is false."),
   },
-  async (args) => callTool("read_console_messages", args)
+  async (args) => {
+    if (args.type === "network") {
+      const { type: _t, ...rest } = args;
+      return callTool("read_network_requests", rest);
+    }
+    const { type: _t, urlPattern: _u, ...rest } = args;
+    return callTool("read_console_messages", rest);
+  }
 );
 
-// 11. read_network_requests
-server.tool(
-  "read_network_requests",
-  "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    urlPattern: z.string().optional().describe("Optional URL pattern to filter requests. Only requests whose URL contains this string will be returned (e.g., '/api/' to filter API calls, 'example.com' to filter by domain)."),
-    limit: z.number().optional().describe("Maximum number of requests to return. Defaults to 100. Increase only if you need more results."),
-    clear: z.boolean().optional().describe("If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."),
-  },
-  async (args) => callTool("read_network_requests", args)
-);
-
-// 12. read_page
+// 10. read_page — also handles get_page_text (format="text") and resize_window via width/height
 server.tool(
   "read_page",
-  "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  'Read the current page. By default returns an accessibility tree of all elements. Use format="text" to extract plain text (ideal for articles/blogs). Use width+height to resize the window first. If you don\'t have a valid tab ID, use tabs_mcp first.',
   {
-    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    filter: z.enum(["interactive", "all"]).optional().describe('Filter elements: "interactive" for buttons/links/inputs only, "all" for all elements including non-visible ones (default: all elements)'),
-    depth: z.number().optional().describe("Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large."),
-    ref_id: z.string().optional().describe("Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."),
-    max_chars: z.number().optional().describe("Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."),
+    tabId: z.number().describe("Tab ID to read from. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
+    format: z.enum(["tree", "text"]).optional().describe(
+      '"tree" (default) — accessibility tree of page elements with refs. "text" — extract raw text content, prioritizing article body. Use "text" for reading articles or blogs.'
+    ),
+    filter: z.enum(["interactive", "all"]).optional().describe('For format="tree": "interactive" for buttons/links/inputs only, "all" for all elements (default).'),
+    depth: z.number().optional().describe('For format="tree": Max tree depth (default: 15). Reduce if output is too large.'),
+    ref_id: z.string().optional().describe('For format="tree": Focus on a specific element and its children. Use when output is too large.'),
+    max_chars: z.number().optional().describe('For format="tree": Max output characters (default: 50000).'),
+    width: z.number().optional().describe("If provided along with height, resize the browser window to these dimensions before reading."),
+    height: z.number().optional().describe("If provided along with width, resize the browser window to these dimensions before reading."),
   },
-  async (args) => callTool("read_page", args)
+  async (args) => {
+    // Handle resize first if requested
+    if (args.width && args.height) {
+      await callTool("resize_window", { tabId: args.tabId, width: args.width, height: args.height });
+    }
+    if (args.format === "text") {
+      const { format: _f, filter: _fi, depth: _d, ref_id: _r, max_chars: _m, width: _w, height: _h, ...rest } = args;
+      return callTool("get_page_text", rest);
+    }
+    const { format: _f, width: _w, height: _h, ...rest } = args;
+    return callTool("read_page", rest);
+  }
 );
 
-// 13. resize_window
+// 12. shortcuts — consolidated shortcuts_list + shortcuts_execute
 server.tool(
-  "resize_window",
-  "Resize the current browser window to specified dimensions. Useful for testing responsive designs or setting up specific screen sizes. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "shortcuts",
+  'List or execute available shortcuts and workflows. Use action="list" first to see what is available, then action="execute" to run one. If you don\'t have a valid tab ID, use tabs_mcp first to get available tabs.',
   {
-    width: z.number().describe("Target window width in pixels"),
-    height: z.number().describe("Target window height in pixels"),
-    tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    action: z.enum(["list", "execute"]).describe(
+      '"list" — list all available shortcuts with their commands and descriptions. "execute" — execute a shortcut or workflow by ID or command name.'
+    ),
+    tabId: z.number().describe("Tab ID. Must be a tab in the current group. Use tabs_mcp first if you don't have a valid tab ID."),
+    shortcutId: z.string().optional().describe('For action="execute": The ID of the shortcut to execute.'),
+    command: z.string().optional().describe('For action="execute": The command name of the shortcut (e.g., "debug", "summarize"). Do not include the leading slash.'),
   },
-  async (args) => callTool("resize_window", args)
+  async (args) => {
+    if (args.action === "execute") {
+      const { action: _a, ...rest } = args;
+      return callTool("shortcuts_execute", rest);
+    }
+    return callTool("shortcuts_list", args);
+  }
 );
 
-// 14. shortcuts_list
+// 13. upload — consolidated upload_image + upload_local_file
 server.tool(
-  "shortcuts_list",
-  "List all available shortcuts and workflows (shortcuts and workflows are interchangeable). Returns shortcuts with their commands, descriptions, and whether they are workflows. Use shortcuts_execute to run a shortcut or workflow.",
+  "upload",
+  "Upload a file or screenshot to a file input or drag & drop target in the browser. Use type=\"image\" for previously captured screenshots, type=\"file\" for local files on disk. If you don't have a valid tab ID, use tabs_mcp first to get available tabs.",
   {
-    tabId: z.number().describe("Tab ID to list shortcuts from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    type: z.enum(["image", "file"]).describe(
+      '"image" — upload a previously captured screenshot (by imageId from the computer screenshot action) to a file input or drag-and-drop target. "file" — upload a local file from disk (by filePath) to a file input element using CDP, bypassing the native OS file picker dialog. Works for video, image, document files.'
+    ),
+    tabId: z.number().describe("Tab ID where the target element is located."),
+    // image-specific
+    imageId: z.string().optional().describe('For type="image": ID of a previously captured screenshot (from computer tool\'s screenshot action) or user-uploaded image.'),
+    ref: z.string().optional().describe('Element reference ID from read_page or find tools. For type="image": targets a specific file input. For type="file": not used (use selector instead).'),
+    coordinate: z.array(z.number()).optional().describe('Viewport coordinates [x, y] for drag & drop. For type="image": use this for drag & drop to visible targets (e.g., Google Docs). Provide either ref or coordinate, not both.'),
+    filename: z.string().optional().describe('For type="image": Optional filename for the uploaded file (default: "image.png").'),
+    // file-specific
+    filePath: z.string().optional().describe('For type="file": Absolute path to the local file on disk (e.g., "C:/Users/Nodnarb/Desktop/video.mp4").'),
+    selector: z.string().optional().describe('For type="file": CSS selector to find the file input element. Defaults to \'input[type="file"]\'.'),
+    inputIndex: z.number().optional().describe('For type="file": Index of the matching input element to use (0-based). Defaults to 0.'),
   },
-  async (args) => callTool("shortcuts_list", args)
+  async (args) => {
+    if (args.type === "file") {
+      const { type: _t, imageId: _i, ref: _r, coordinate: _c, filename: _f, ...rest } = args;
+      return callTool("upload_local_file", rest);
+    }
+    // type === "image"
+    const { type: _t, filePath: _fp, selector: _s, inputIndex: _ii, ...rest } = args;
+    return callTool("upload_image", rest);
+  }
 );
 
-// 15. shortcuts_execute
-server.tool(
-  "shortcuts_execute",
-  "Execute a shortcut or workflow by running it in a new sidepanel window using the current tab (shortcuts and workflows are interchangeable). Use shortcuts_list first to see available shortcuts. This starts the execution and returns immediately - it does not wait for completion.",
-  {
-    tabId: z.number().describe("Tab ID to execute the shortcut on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    shortcutId: z.string().optional().describe("The ID of the shortcut to execute"),
-    command: z.string().optional().describe("The command name of the shortcut to execute (e.g., 'debug', 'summarize'). Do not include the leading slash."),
-  },
-  async (args) => callTool("shortcuts_execute", args)
-);
-
-// 16. switch_browser
+// Also expose switch_browser and update_plan as before
 server.tool(
   "switch_browser",
   "Switch which Chrome browser is used for browser automation. Call this when the user wants to connect to a different Chrome browser. Broadcasts a connection request to all Chrome browsers with the extension installed \u2014 the user clicks 'Connect' in the desired browser.",
@@ -668,7 +708,6 @@ server.tool(
   async (args) => callTool("switch_browser", args)
 );
 
-// 17. update_plan
 server.tool(
   "update_plan",
   "Present a plan to the user for approval before taking actions. The user will see the domains you intend to visit and your approach. Once approved, you can proceed with actions on the approved domains without additional permission prompts.",
@@ -677,20 +716,6 @@ server.tool(
     approach: z.array(z.string()).describe("High-level description of what you will do. Focus on outcomes and key actions, not implementation details. Be concise - aim for 3-7 items."),
   },
   async (args) => callTool("update_plan", args)
-);
-
-// 18. upload_image
-server.tool(
-  "upload_image",
-  "Upload a previously captured screenshot or user-uploaded image to a file input or drag & drop target. Supports two approaches: (1) ref - for targeting specific elements, especially hidden file inputs, (2) coordinate - for drag & drop to visible locations like Google Docs. Provide either ref or coordinate, not both.",
-  {
-    imageId: z.string().describe("ID of a previously captured screenshot (from the computer tool's screenshot action) or a user-uploaded image"),
-    tabId: z.number().describe("Tab ID where the target element is located. This is where the image will be uploaded to."),
-    ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Use this for file inputs (especially hidden ones) or specific elements. Provide either ref or coordinate, not both.'),
-    coordinate: z.array(z.number()).optional().describe("Viewport coordinates [x, y] for drag & drop to a visible location. Use this for drag & drop targets like Google Docs. Provide either ref or coordinate, not both."),
-    filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
-  },
-  async (args) => callTool("upload_image", args)
 );
 
 // --- Start MCP server ---
