@@ -246,6 +246,37 @@ Default port is 18765. To change:
    ```
 2. Restart browser and Claude Code
 
+### API Error: "Unexpected content chunk type `tool_reference`" (400)
+
+When Claude Code has enough tools (across **all** your MCP servers plus its built-ins), it activates **Tool Search** mode and emits `tool_reference` content blocks in the request. Some backends reject those with a 400 — notably **AWS Bedrock**, **Vertex AI**, some **OpenAI-compatible proxies**, and older model snapshots.
+
+**Fix #1 — disable Tool Search (recommended, zero cost, no change to the tool surface):**
+
+Set the environment variable before launching Claude Code:
+```bash
+export ENABLE_TOOL_SEARCH=false
+```
+This stops Claude Code from emitting `tool_reference` blocks entirely. Note that when your `ANTHROPIC_BASE_URL` points at a **non-first-party** host (i.e. a proxy/Bedrock/Vertex gateway), Claude Code **already auto-disables** Tool Search — so you may only need this on setups that still route through a first-party host. This is strictly preferable to shrinking the tool surface, because it keeps full parity **and** costs nothing.
+
+**Fix #2 — opt-in tool consolidation (fallback, only if you can't set the env var):**
+
+This server can merge 7 related tools into 4 discriminated-union tools, lowering its own registered count from **18 → 15**. It is **off by default** to preserve parity with the official extension. Enable it in `~/.config/open-claude-in-chrome/config.json`:
+```json
+{ "consolidateTools": true }
+```
+(or set `OCIC_CONSOLIDATE_TOOLS=true` in the environment), then restart the browser and Claude Code.
+
+Consolidations applied when enabled:
+
+| Consolidated tool | Replaces | Discriminator |
+| --- | --- | --- |
+| `tabs_mcp` | `tabs_context_mcp`, `tabs_create_mcp` | `action: "context" \| "create"` |
+| `read_debug` | `read_console_messages`, `read_network_requests` | `type: "console" \| "network"` |
+| `shortcuts` | `shortcuts_list`, `shortcuts_execute` | `action: "list" \| "execute"` |
+| `read_page_text` | `get_page_text` | (plain-text alias) |
+
+`resize_window` and `upload_image` are intentionally **not** merged — folding a resize into `read_page` would make a "read" silently resize the window, and a single-`type` union adds friction for no reduction. Because consolidation only trims **this** server's count (not the global total that triggers Tool Search) and only marginally reduces the schema token footprint, Fix #1 is the better lever for most users.
+
 ## License
 
 MIT

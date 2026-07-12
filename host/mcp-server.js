@@ -20,17 +20,35 @@ import { z } from "zod";
 
 const DEFAULT_PORT = 18765;
 
-function getPort() {
+function readConfig() {
   const configPath = path.join(os.homedir(), ".config", "open-claude-in-chrome", "config.json");
   try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return config.port || DEFAULT_PORT;
+    return JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch {
-    return DEFAULT_PORT;
+    return {};
   }
 }
 
+const CONFIG = readConfig();
+
+function getPort() {
+  return CONFIG.port || DEFAULT_PORT;
+}
+
 const TCP_PORT = getPort();
+
+// Opt-in tool consolidation (default OFF = full parity with official Claude in Chrome).
+// When enabled, 7 related tools are merged into 4 discriminated-union tools, dropping
+// the registered tool count from 18 to 15. This is only useful for backends that reject
+// the `tool_reference` content blocks Claude Code emits in "Tool Search" mode (AWS Bedrock,
+// Vertex AI, some OpenAI-compatible proxies, older models). See README "Tool consolidation".
+//
+// PREFER the zero-cost fix first: set ENABLE_TOOL_SEARCH=false in your environment, which
+// disables tool_reference emission at the source without changing the tool surface at all.
+// (On non-first-party ANTHROPIC_BASE_URL hosts, Claude Code already auto-disables it.)
+// Only reach for this flag if you cannot set that env var.
+const CONSOLIDATE = CONFIG.consolidateTools === true
+  || String(process.env.OCIC_CONSOLIDATE_TOOLS || "").toLowerCase() === "true";
 
 // --- Mode detection ---
 // Try to bind the port. If it's taken, switch to client mode.
@@ -438,7 +456,9 @@ async function callTool(toolName, args) {
   }
 }
 
-// --- MCP Server with all 18 tools ---
+// --- MCP Server ---
+// Default: all 18 tools (parity with official Claude in Chrome).
+// With config.consolidateTools=true: 15 consolidated tools (see CONSOLIDATE above).
 
 const server = new McpServer({
   name: "open-claude-in-chrome",
@@ -467,21 +487,22 @@ const server = new McpServer({
     });
   };
 }
-// 1. tabs_context_mcp
-server.tool(
-  "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
-  { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
-  async (args) => callTool("tabs_context_mcp", args)
-);
+// 1-2. tabs_context_mcp + tabs_create_mcp (parity mode) — consolidated into tabs_mcp below
+if (!CONSOLIDATE) {
+  server.tool(
+    "tabs_context_mcp",
+    "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+    { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
+    async (args) => callTool("tabs_context_mcp", args)
+  );
 
-// 2. tabs_create_mcp
-server.tool(
-  "tabs_create_mcp",
-  "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
-  {},
-  async (args) => callTool("tabs_create_mcp", args)
-);
+  server.tool(
+    "tabs_create_mcp",
+    "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
+    {},
+    async (args) => callTool("tabs_create_mcp", args)
+  );
+}
 
 // 3. navigate
 server.tool(
@@ -542,15 +563,17 @@ server.tool(
   async (args) => callTool("form_input", args)
 );
 
-// 7. get_page_text
-server.tool(
-  "get_page_text",
-  "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("get_page_text", args)
-);
+// 7. get_page_text (parity mode) — consolidated into read_page(format="text") below
+if (!CONSOLIDATE) {
+  server.tool(
+    "get_page_text",
+    "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+    {
+      tabId: z.number().describe("Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    },
+    async (args) => callTool("get_page_text", args)
+  );
+}
 
 // 8. gif_creator
 server.tool(
@@ -585,32 +608,33 @@ server.tool(
   async (args) => callTool("javascript_tool", args)
 );
 
-// 10. read_console_messages
-server.tool(
-  "read_console_messages",
-  "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
-  {
-    tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    pattern: z.string().optional().describe("Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages."),
-    limit: z.number().optional().describe("Maximum number of messages to return. Defaults to 100. Increase only if you need more results."),
-    onlyErrors: z.boolean().optional().describe("If true, only return error and exception messages. Default is false (return all message types)."),
-    clear: z.boolean().optional().describe("If true, clear the console messages after reading to avoid duplicates on subsequent calls. Default is false."),
-  },
-  async (args) => callTool("read_console_messages", args)
-);
+// 10-11. read_console_messages + read_network_requests (parity mode) — consolidated into read_debug below
+if (!CONSOLIDATE) {
+  server.tool(
+    "read_console_messages",
+    "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
+    {
+      tabId: z.number().describe("Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+      pattern: z.string().optional().describe("Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages."),
+      limit: z.number().optional().describe("Maximum number of messages to return. Defaults to 100. Increase only if you need more results."),
+      onlyErrors: z.boolean().optional().describe("If true, only return error and exception messages. Default is false (return all message types)."),
+      clear: z.boolean().optional().describe("If true, clear the console messages after reading to avoid duplicates on subsequent calls. Default is false."),
+    },
+    async (args) => callTool("read_console_messages", args)
+  );
 
-// 11. read_network_requests
-server.tool(
-  "read_network_requests",
-  "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
-  {
-    tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    urlPattern: z.string().optional().describe("Optional URL pattern to filter requests. Only requests whose URL contains this string will be returned (e.g., '/api/' to filter API calls, 'example.com' to filter by domain)."),
-    limit: z.number().optional().describe("Maximum number of requests to return. Defaults to 100. Increase only if you need more results."),
-    clear: z.boolean().optional().describe("If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."),
-  },
-  async (args) => callTool("read_network_requests", args)
-);
+  server.tool(
+    "read_network_requests",
+    "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+    {
+      tabId: z.number().describe("Tab ID to read network requests from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+      urlPattern: z.string().optional().describe("Optional URL pattern to filter requests. Only requests whose URL contains this string will be returned (e.g., '/api/' to filter API calls, 'example.com' to filter by domain)."),
+      limit: z.number().optional().describe("Maximum number of requests to return. Defaults to 100. Increase only if you need more results."),
+      clear: z.boolean().optional().describe("If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."),
+    },
+    async (args) => callTool("read_network_requests", args)
+  );
+}
 
 // 12. read_page
 server.tool(
@@ -638,27 +662,28 @@ server.tool(
   async (args) => callTool("resize_window", args)
 );
 
-// 14. shortcuts_list
-server.tool(
-  "shortcuts_list",
-  "List all available shortcuts and workflows (shortcuts and workflows are interchangeable). Returns shortcuts with their commands, descriptions, and whether they are workflows. Use shortcuts_execute to run a shortcut or workflow.",
-  {
-    tabId: z.number().describe("Tab ID to list shortcuts from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-  },
-  async (args) => callTool("shortcuts_list", args)
-);
+// 14-15. shortcuts_list + shortcuts_execute (parity mode) — consolidated into shortcuts below
+if (!CONSOLIDATE) {
+  server.tool(
+    "shortcuts_list",
+    "List all available shortcuts and workflows (shortcuts and workflows are interchangeable). Returns shortcuts with their commands, descriptions, and whether they are workflows. Use shortcuts_execute to run a shortcut or workflow.",
+    {
+      tabId: z.number().describe("Tab ID to list shortcuts from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    },
+    async (args) => callTool("shortcuts_list", args)
+  );
 
-// 15. shortcuts_execute
-server.tool(
-  "shortcuts_execute",
-  "Execute a shortcut or workflow by running it in a new sidepanel window using the current tab (shortcuts and workflows are interchangeable). Use shortcuts_list first to see available shortcuts. This starts the execution and returns immediately - it does not wait for completion.",
-  {
-    tabId: z.number().describe("Tab ID to execute the shortcut on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
-    shortcutId: z.string().optional().describe("The ID of the shortcut to execute"),
-    command: z.string().optional().describe("The command name of the shortcut to execute (e.g., 'debug', 'summarize'). Do not include the leading slash."),
-  },
-  async (args) => callTool("shortcuts_execute", args)
-);
+  server.tool(
+    "shortcuts_execute",
+    "Execute a shortcut or workflow by running it in a new sidepanel window using the current tab (shortcuts and workflows are interchangeable). Use shortcuts_list first to see available shortcuts. This starts the execution and returns immediately - it does not wait for completion.",
+    {
+      tabId: z.number().describe("Tab ID to execute the shortcut on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+      shortcutId: z.string().optional().describe("The ID of the shortcut to execute"),
+      command: z.string().optional().describe("The command name of the shortcut to execute (e.g., 'debug', 'summarize'). Do not include the leading slash."),
+    },
+    async (args) => callTool("shortcuts_execute", args)
+  );
+}
 
 // 16. switch_browser
 server.tool(
@@ -692,6 +717,75 @@ server.tool(
   },
   async (args) => callTool("upload_image", args)
 );
+
+// --- Consolidated tools (only registered when CONSOLIDATE is enabled) ---
+// These merge the parity tools gated out above into discriminated-union tools,
+// lowering the registered tool count from 18 to 15. Backend functionality is
+// identical — the same underlying callTool() targets are dispatched by action/type.
+// NOTE: resize_window and upload_image are intentionally NOT merged, to avoid
+// surprising side effects (a "read" that resizes) and low-value single-type unions.
+if (CONSOLIDATE) {
+  // tabs_context_mcp + tabs_create_mcp -> tabs_mcp
+  server.tool(
+    "tabs_mcp",
+    'Manage MCP tab group. CRITICAL: Call with action="context" at least once before using other browser tools to get valid tab IDs. Each new conversation should create its own tab with action="create" rather than reusing existing tabs.',
+    {
+      action: z.enum(["context", "create"]).describe('Action to perform: "context" — get the current MCP tab group info and all tab IDs (use createIfEmpty to auto-create if none exists); "create" — create a new empty tab in the MCP tab group.'),
+      createIfEmpty: z.boolean().optional().describe('For action="context" only: if no MCP tab group exists, create a new window with a tab group. Has no effect if a group already exists.'),
+    },
+    async (args) => {
+      if (args.action === "create") return callTool("tabs_create_mcp", args);
+      return callTool("tabs_context_mcp", args);
+    }
+  );
+
+  // read_console_messages + read_network_requests -> read_debug
+  server.tool(
+    "read_debug",
+    'Read debugging data from a tab. type="console" returns console messages (console.log/error/warn); type="network" returns HTTP requests (XHR/Fetch/documents). If you don\'t have a valid tab ID, use tabs_mcp first.',
+    {
+      type: z.enum(["console", "network"]).describe('Which debug stream to read: "console" for console messages, "network" for HTTP requests.'),
+      tabId: z.number().describe("Tab ID to read from. Use tabs_mcp first if you don't have a valid tab ID."),
+      pattern: z.string().optional().describe('For type="console": regex to filter messages (always provide one to avoid noise).'),
+      urlPattern: z.string().optional().describe('For type="network": substring to filter request URLs (e.g., "/api/").'),
+      limit: z.number().optional().describe("Maximum number of entries to return (default: 100)."),
+      onlyErrors: z.boolean().optional().describe('For type="console" only: if true, return only errors/exceptions.'),
+      clear: z.boolean().optional().describe("If true, clear the buffer after reading to avoid duplicates on subsequent calls."),
+    },
+    async (args) => {
+      const { type, ...rest } = args;
+      if (type === "network") return callTool("read_network_requests", rest);
+      return callTool("read_console_messages", rest);
+    }
+  );
+
+  // get_page_text -> read_page(format="text"); the read_page tool itself is already
+  // registered above. We register a text-capable alias by dispatching on format.
+  server.tool(
+    "read_page_text",
+    'Extract plain text content from the page (ideal for articles/blogs), without HTML formatting. Equivalent to the parity-mode get_page_text tool. If you don\'t have a valid tab ID, use tabs_mcp first.',
+    {
+      tabId: z.number().describe("Tab ID to extract text from. Use tabs_mcp first if you don't have a valid tab ID."),
+    },
+    async (args) => callTool("get_page_text", args)
+  );
+
+  // shortcuts_list + shortcuts_execute -> shortcuts
+  server.tool(
+    "shortcuts",
+    'Manage shortcuts/workflows. action="list" returns available shortcuts; action="execute" runs one (starts and returns immediately). Call action="list" first to see what is available.',
+    {
+      action: z.enum(["list", "execute"]).describe('Action to perform: "list" to enumerate shortcuts, "execute" to run one.'),
+      tabId: z.number().describe("Tab ID. Use tabs_mcp first if you don't have a valid tab ID."),
+      shortcutId: z.string().optional().describe('For action="execute": the ID of the shortcut to execute.'),
+      command: z.string().optional().describe('For action="execute": the command name (e.g., "debug", "summarize"), no leading slash.'),
+    },
+    async (args) => {
+      if (args.action === "execute") return callTool("shortcuts_execute", args);
+      return callTool("shortcuts_list", args);
+    }
+  );
+}
 
 // --- Start MCP server ---
 
