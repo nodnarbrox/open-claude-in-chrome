@@ -693,6 +693,20 @@ server.tool(
   async (args) => callTool("upload_image", args)
 );
 
+// 19. upload_local_file
+server.tool(
+  "upload_local_file",
+  "Upload one or more files from the local filesystem to a file input on the page. Unlike upload_image (which uploads captured screenshots), this reads real files from disk by path \u2014 works for videos, PDFs, documents, and any other file type. Uses CDP Page.setInterceptFileChooserDialog to bypass Chrome's user-activation requirement for the native file picker.",
+  {
+    tabId: z.number().describe("Tab ID where the target file input is located."),
+    filePath: z.string().optional().describe('Absolute path to a single file on the local filesystem (e.g., "/home/user/video.mp4"). Provide either filePath or filePaths.'),
+    filePaths: z.array(z.string()).optional().describe("Array of absolute file paths for uploading multiple files to a single multi-file input. Provide either filePath or filePaths."),
+    selector: z.string().optional().describe('CSS selector for the target file input (default: \'input[type="file"]\').'),
+    inputIndex: z.number().optional().describe("Which matching input to use when the selector matches several (default: 0)."),
+  },
+  async (args) => callTool("upload_local_file", args)
+);
+
 // --- Start MCP server ---
 
 const transport = new StdioServerTransport();

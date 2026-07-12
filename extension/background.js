@@ -881,9 +881,11 @@ const toolHandlers = {
   // selector: CSS selector to find the file input (default: 'input[type="file"]')
   // inputIndex: which matching input to use (default: 0)
   async upload_local_file(args) {
-    const { tabId, filePath, selector = 'input[type="file"]', inputIndex = 0 } = args;
+    const { tabId, filePath, filePaths, selector = 'input[type="file"]', inputIndex = 0 } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
-    if (!filePath) return { content: [{ type: "text", text: "filePath is required" }] };
+    // Support both single filePath and array filePaths
+    const fileList = filePaths ? (Array.isArray(filePaths) ? filePaths : [filePaths]) : (filePath ? [filePath] : null);
+    if (!fileList || fileList.length === 0) return { content: [{ type: "text", text: "filePath or filePaths is required" }] };
 
     await ensureAttached(tabId);
 
@@ -912,10 +914,10 @@ const toolHandlers = {
         // params.backendNodeId is the "blessed" handle that Chrome allows setFileInputFiles on
         chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
           backendNodeId: params.backendNodeId,
-          files: [filePath],
+          files: fileList,
         }).then(() => {
           chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
-          resolve(`File injected: ${filePath}`);
+          resolve(`Files injected: ${fileList.join(', ')}`);
         }).catch(err => {
           chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
           reject(err);
@@ -926,6 +928,7 @@ const toolHandlers = {
     });
 
     // Trigger the file input click — this fires fileChooserOpened instead of OS dialog
+    // userGesture: true is required so Chrome treats it as a trusted event and fires fileChooserOpened
     await cdp(tabId, "Runtime.evaluate", {
       expression: `(() => {
         const inputs = document.querySelectorAll(${JSON.stringify(selector)});
@@ -935,6 +938,7 @@ const toolHandlers = {
         return 'clicked';
       })()`,
       returnByValue: true,
+      userGesture: true,
     });
 
     try {
